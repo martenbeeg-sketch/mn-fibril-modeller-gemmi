@@ -8,21 +8,34 @@ This project is intentionally separate from the stable app so we can rework pars
 
 - separate project folder
 - separate Python package: `mn_fibril_modeller_gemmi`
-- shared conda env: `mn-fibril-modeller`
+- conda environment file included (`environment.yml`)
 - dedicated launcher: `app-gemmi`
 - Gemmi included from the start as the intended primary structure library
 
-## Shared Environment
+## Installation On A New Computer
 
-This copy is meant to reuse the existing conda environment instead of creating a new one.
-
+1. Clone the repository.
 ```bash
-cd /home/user/programs/ovo/mn-fibril-modeller-gemmi
+git clone <YOUR_REPO_URL>
+cd mn-fibril-modeller-gemmi
+```
+
+2. Create the conda environment.
+```bash
+conda env create -f environment.yml
+```
+
+3. Activate the environment.
+```bash
 conda activate mn-fibril-modeller
+```
+
+4. (Optional) Reinstall editable mode after pulling updates.
+```bash
 pip install -e .
 ```
 
-## Run The Experimental App
+## Run The App
 
 ```bash
 conda activate mn-fibril-modeller
@@ -41,18 +54,21 @@ Headless mode is also supported:
 app-gemmi --headless
 ```
 
-## Purpose
+## Optional: Rosetta Optimization Requirements
 
-The goal of this copy is to move structure operations toward a Gemmi-first implementation while preserving the current UI and workflow as a familiar baseline.
-
-The stable app remains in:
+Rosetta optimization uses Docker and expects the image:
 
 ```text
-/home/user/programs/ovo/mn-fibril-modeller
+ovo-proteinmpnn-fastrelax
 ```
 
-The experimental Gemmi app lives in:
+If Docker or the image is unavailable, propagation/inspection/export still work, but Rosetta optimization will be disabled in the UI.
 
-```text
-/home/user/programs/ovo/mn-fibril-modeller-gemmi
+## Development
+
+Run tests:
+
+```bash
+conda activate mn-fibril-modeller
+pytest
 ```
