@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mn-fibril-modeller-gemmi"
+version = "0.1.0"
+description = "Gemmi-focused experimental copy of the standalone fibril modelling app."
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "MN Fibril Modeller Contributors" }
+]
+dependencies = [
+  "biopython",
+  "gemmi",
+  "numpy",
+  "pandas",
+  "streamlit",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+]
+
+[project.scripts]
+app-gemmi = "mn_fibril_modeller_gemmi.cli:main"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["mn_fibril_modeller_gemmi*"]
+
+[tool.setuptools.package-data]
+"mn_fibril_modeller_gemmi.viewer.molstar_custom_component" = ["frontend/build/*"]
+"mn_fibril_modeller_gemmi.rosetta" = ["*.py"]

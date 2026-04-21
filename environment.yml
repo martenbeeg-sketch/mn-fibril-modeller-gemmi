@@ -1,0 +1,14 @@
+name: mn-fibril-modeller
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - biopython
+  - gemmi
+  - numpy
+  - pandas
+  - streamlit
+  - pytest
+  - pip:
+      - -e .
