@@ -58,6 +58,7 @@ MERGED_RESIDUE_GAP = 20
 INSPECT_MAX_ATOMS = 3000
 INSPECT_MAX_PAIR_CHECKS = 500000
 INSPECT_MAX_REPORTED_CONTACTS = 100
+SHOW_PROPAGATION_DEBUG_UI = False
 
 
 def _uploaded_text(uploaded_file) -> str:
@@ -121,6 +122,9 @@ def _all_score_row(scores: dict, state: str | None = None) -> dict:
 def _run_propagation_with_feedback(pdb_text: str, build_settings: dict):
     progress = st.progress(0, text="Preparing propagation job...")
     status = st.empty()
+    debug_mode = bool(st.session_state.get("propagation_debug_mode", False))
+    debug_events: list[dict] = []
+    st.session_state["propagation_debug_events"] = []
 
     def _progress_update(
         *,
@@ -158,7 +162,10 @@ def _run_propagation_with_feedback(pdb_text: str, build_settings: dict):
             protofibril_configs=build_settings["protofibril_configs"],
             structure_format=st.session_state.get("current_structure_format"),
             progress_callback=_progress_update,
+            debug_mode=debug_mode,
+            debug_sink=debug_events,
         )
+        st.session_state["propagation_debug_events"] = debug_events
 
         status.caption("Storing propagated chain membership and output structure.")
         progress.progress(97, text="Finalizing propagated structure...")
@@ -180,6 +187,9 @@ def _run_propagation_with_feedback(pdb_text: str, build_settings: dict):
         status.caption("Propagation finished.")
         progress.progress(100, text="Propagation finished.")
         return propagation_result
+    except Exception:
+        st.session_state["propagation_debug_events"] = debug_events
+        raise
     finally:
         progress.empty()
         status.empty()
@@ -493,6 +503,7 @@ def _render_protofibril_assignment_viewer(pdb_text: str, chain_rows, protofibril
             )
         )
 
+    assignment_key = "protofibril_assignment_preview"
     molstar_custom_component(
         structures=[
             StructureVisualization(
@@ -501,7 +512,7 @@ def _render_protofibril_assignment_viewer(pdb_text: str, chain_rows, protofibril
                 chains=chain_visualizations,
             )
         ],
-        key="protofibril_assignment_preview",
+        key=assignment_key,
         height=720,
         show_controls=True,
         force_reload=False,
@@ -534,14 +545,37 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
 
     highlighted_top = set()
     highlighted_bottom = set()
-    highlighted_transform = set()
+    highlighted_reference = set()
+    highlighted_propagated = set()
     for config in configs:
-        if config["top_chain"]:
+        direction = config.get("propagation_direction", "Add to both ends")
+        use_top = direction in {"Add to top", "Add to both ends"}
+        use_bottom = direction in {"Add to bottom", "Add to both ends"}
+        proto_chain_order = list(config.get("chains", []))
+        addition_unit = int(config.get("addition_unit", 1))
+        if use_top and config["top_chain"]:
             highlighted_top.add(config["top_chain"])
-        if config["bottom_chain"]:
+        if use_bottom and config["bottom_chain"]:
             highlighted_bottom.add(config["bottom_chain"])
-        highlighted_transform.update(config.get("top_reference_pair", []))
-        highlighted_transform.update(config.get("bottom_reference_pair", []))
+        # Reference chains should be only the "paired chain" combobox values (pair source, index 0).
+        top_pair = config.get("top_reference_pair", [])
+        bottom_pair = config.get("bottom_reference_pair", [])
+        if use_top and len(top_pair) == 2:
+            highlighted_reference.add(top_pair[0])
+        if use_bottom and len(bottom_pair) == 2:
+            highlighted_reference.add(bottom_pair[0])
+
+        # Propagation-view highlighting follows configured addition-unit size.
+        # This indicates the chain subset participating in each propagation step.
+        if proto_chain_order:
+            capped_unit = max(1, min(addition_unit, len(proto_chain_order)))
+            if direction == "Add to top":
+                highlighted_propagated.update(proto_chain_order[-capped_unit:])
+            elif direction == "Add to bottom":
+                highlighted_propagated.update(proto_chain_order[:capped_unit])
+            else:
+                highlighted_propagated.update(proto_chain_order[:capped_unit])
+                highlighted_propagated.update(proto_chain_order[-capped_unit:])
 
     top_bottom_visualizations = []
     reference_visualizations = []
@@ -551,6 +585,9 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
 
         top_bottom_color = "#C7CEDB"
         top_bottom_representation = "cartoon"
+        if chain_id in highlighted_reference:
+            top_bottom_color = TRANSFORM_CHAIN_COLOR
+            top_bottom_representation = "cartoon+ball-and-stick"
         if chain_id in highlighted_bottom:
             top_bottom_color = BOTTOM_CHAIN_COLOR
             top_bottom_representation = "cartoon+ball-and-stick"
@@ -567,8 +604,11 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
             )
         )
 
-        reference_color = TRANSFORM_CHAIN_COLOR if chain_id in highlighted_transform else base_color
-        reference_representation = "cartoon+ball-and-stick" if chain_id in highlighted_transform else "cartoon"
+        reference_color = "#C7CEDB"
+        reference_representation = "cartoon"
+        if chain_id in highlighted_propagated:
+            reference_color = TRANSFORM_CHAIN_COLOR
+            reference_representation = "cartoon+ball-and-stick"
         reference_visualizations.append(
             ChainVisualization(
                 chain_id=chain_id,
@@ -580,10 +620,38 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
         )
 
     viewer_height = 820
+    st.markdown(
+        (
+            f"Legend: "
+            f"<span style='color:{TOP_CHAIN_COLOR}; font-weight:600;'>top chain</span> | "
+            f"<span style='color:{BOTTOM_CHAIN_COLOR}; font-weight:600;'>bottom chain</span> | "
+            f"<span style='color:{TRANSFORM_CHAIN_COLOR}; font-weight:600;'>reference chain (left) / propagated chain (right)</span>"
+        ),
+        unsafe_allow_html=True,
+    )
+    top_bottom_key = "growth_top_bottom_preview"
+    reference_key = "growth_reference_preview"
     left, right = st.columns([1, 1], gap="medium")
 
     with left:
-        st.caption(f"Top/Bottom chains: top = {', '.join(sorted(highlighted_top)) or 'none'}, bottom = {', '.join(sorted(highlighted_bottom)) or 'none'}")
+        modes = {config.get("propagation_direction", "Add to both ends") for config in configs}
+        active_mode = next(iter(modes)) if len(modes) == 1 else "Mixed"
+        if active_mode == "Add to top":
+            st.caption(
+                f"Top chains: {', '.join(sorted(highlighted_top)) or 'none'} | "
+                f"Reference chains: {', '.join(sorted(highlighted_reference)) or 'none'}"
+            )
+        elif active_mode == "Add to bottom":
+            st.caption(
+                f"Bottom chains: {', '.join(sorted(highlighted_bottom)) or 'none'} | "
+                f"Reference chains: {', '.join(sorted(highlighted_reference)) or 'none'}"
+            )
+        else:
+            st.caption(
+                f"Top/Bottom chains: top = {', '.join(sorted(highlighted_top)) or 'none'}, "
+                f"bottom = {', '.join(sorted(highlighted_bottom)) or 'none'} | "
+                f"Reference chains: {', '.join(sorted(highlighted_reference)) or 'none'}"
+            )
         molstar_custom_component(
             structures=[
                 StructureVisualization(
@@ -592,7 +660,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
                     chains=top_bottom_visualizations,
                 )
             ],
-            key="growth_top_bottom_preview",
+            key=top_bottom_key,
             height=viewer_height,
             width="100%",
             show_controls=True,
@@ -600,7 +668,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
         )
 
     with right:
-        st.caption(f"Reference chains: {', '.join(sorted(highlighted_transform)) or 'none'}")
+        st.caption(f"Propagated chains: {', '.join(sorted(highlighted_propagated)) or 'none'}")
         molstar_custom_component(
             structures=[
                 StructureVisualization(
@@ -609,7 +677,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
                     chains=reference_visualizations,
                 )
             ],
-            key="growth_reference_preview",
+            key=reference_key,
             height=viewer_height,
             width="100%",
             show_controls=True,
@@ -767,6 +835,13 @@ def _render_step_4_build(chain_rows):
         )
         return {"protofibril_configs": []}
     max_shared_addition_unit = min((len(chains) for chains in assigned_proto_chain_lists), default=1)
+    # Streamlit keeps widget state across reruns; clamp stale values when the
+    # allowed max shrinks (e.g., after changing protofibril assignments).
+    current_addition_unit = int(st.session_state.get("global_addition_unit", 1))
+    if current_addition_unit > max_shared_addition_unit:
+        st.session_state["global_addition_unit"] = max_shared_addition_unit
+    elif current_addition_unit < 1:
+        st.session_state["global_addition_unit"] = 1
 
     st.markdown("**Shared Growth Settings**")
     global_propagation_direction = st.radio(
@@ -774,6 +849,15 @@ def _render_step_4_build(chain_rows):
         options=["Add to top", "Add to bottom", "Add to both ends"],
         key="global_growth_direction",
         help="The same direction will be used for every protofibril in this modelling run.",
+    )
+    global_addition_unit = st.number_input(
+        "Addition unit size for all protofibrils",
+        min_value=1,
+        max_value=max_shared_addition_unit,
+        value=int(st.session_state.get("global_addition_unit", 1)),
+        step=1,
+        key="global_addition_unit",
+        help="This is the number of chains added per propagation step, shared across all protofibrils.",
     )
     global_units_to_add = st.number_input(
         "Number of addition units for all protofibrils",
@@ -783,15 +867,6 @@ def _render_step_4_build(chain_rows):
         step=1,
         key="global_units_to_add",
         help="This is the number of iterative propagation cycles, shared across all protofibrils.",
-    )
-    global_addition_unit = st.number_input(
-        "Addition unit size for all protofibrils",
-        min_value=1,
-        max_value=max_shared_addition_unit,
-        value=min(int(st.session_state.get("global_addition_unit", 1)), max_shared_addition_unit),
-        step=1,
-        key="global_addition_unit",
-        help="This is the number of chains added per propagation step, shared across all protofibrils.",
     )
     st.caption(
         f"Addition unit size is capped by the smallest assigned protofibril. "
@@ -830,6 +905,13 @@ def _render_step_4_build(chain_rows):
             "Large structures may still be slower to render."
         )
 
+    def _sync_selectbox_key_to_options(key: str, options: list[str]) -> None:
+        if not options:
+            return
+        current_value = st.session_state.get(key)
+        if current_value not in options:
+            st.session_state[key] = options[0]
+
     configs = []
     for proto_index in range(1, protofibril_count + 1):
         proto_key = f"protofibril_{proto_index}_chains"
@@ -839,45 +921,100 @@ def _render_step_4_build(chain_rows):
             st.info("Assign chains to this protofibril in step 3 first.")
             continue
 
-        bottom_chain = st.selectbox(
-            f"Bottom chain for protofibril {proto_index}",
-            options=proto_chains,
-            key=f"proto_{proto_index}_bottom_chain",
-        )
-        top_options = [chain_id for chain_id in proto_chains if chain_id != bottom_chain]
-        if not top_options:
-            st.warning("This protofibril needs at least two chains to define a bottom and a top.")
+        if len(proto_chains) < 2:
+            st.warning("This protofibril needs at least two chains to define a propagation pair.")
             continue
-        top_chain = st.selectbox(
-            f"Top chain for protofibril {proto_index}",
-            options=top_options,
-            key=f"proto_{proto_index}_top_chain",
-        )
 
-        inner_chains = [chain_id for chain_id in proto_chains if chain_id not in {bottom_chain, top_chain}]
-        default_top_partner = inner_chains[-1] if inner_chains else bottom_chain
-        default_bottom_partner = inner_chains[0] if inner_chains else top_chain
+        two_chain_mode = len(proto_chains) == 2
+        top_chain = proto_chains[-1]
+        bottom_chain = proto_chains[0]
+        top_reference_pair = []
+        bottom_reference_pair = []
 
-        top_partner_options = [chain_id for chain_id in proto_chains if chain_id != top_chain]
-        top_partner = st.selectbox(
-            f"Chain paired with top chain for protofibril {proto_index}",
-            options=top_partner_options,
-            index=top_partner_options.index(default_top_partner) if default_top_partner in top_partner_options else 0,
-            key=f"proto_{proto_index}_top_partner",
-            help="This chain and the top chain define the stacking step used to extend the top end.",
-        )
-        bottom_partner_options = [chain_id for chain_id in proto_chains if chain_id != bottom_chain]
-        bottom_partner = st.selectbox(
-            f"Chain paired with bottom chain for protofibril {proto_index}",
-            options=bottom_partner_options,
-            index=bottom_partner_options.index(default_bottom_partner) if default_bottom_partner in bottom_partner_options else 0,
-            key=f"proto_{proto_index}_bottom_partner",
-            help="This chain and the bottom chain define the stacking step used to extend the bottom end.",
-        )
-        top_reference_pair = [top_partner, top_chain]
-        bottom_reference_pair = [bottom_chain, bottom_partner]
-        st.caption(f"Top propagation pair: {top_partner} -> {top_chain}")
-        st.caption(f"Bottom propagation pair: {bottom_chain} -> {bottom_partner}")
+        if global_propagation_direction in {"Add to bottom", "Add to both ends"}:
+            bottom_chain_key = f"proto_{proto_index}_bottom_chain"
+            _sync_selectbox_key_to_options(bottom_chain_key, proto_chains)
+            bottom_chain = st.selectbox(
+                f"Bottom chain for protofibril {proto_index}",
+                options=proto_chains,
+                key=bottom_chain_key,
+            )
+            bottom_partner_options = [chain_id for chain_id in proto_chains if chain_id != bottom_chain]
+            if not bottom_partner_options:
+                st.warning("Select at least two chains to define the bottom propagation pair.")
+                continue
+            if two_chain_mode:
+                bottom_partner = bottom_partner_options[0]
+            else:
+                bottom_partner_key = f"proto_{proto_index}_bottom_partner"
+                _sync_selectbox_key_to_options(bottom_partner_key, bottom_partner_options)
+                bottom_partner = st.selectbox(
+                    f"Chain paired with bottom chain for protofibril {proto_index}",
+                    options=bottom_partner_options,
+                    key=bottom_partner_key,
+                    help="This chain and the bottom chain define the stacking step used to extend the bottom end.",
+                )
+            bottom_reference_pair = [bottom_partner, bottom_chain]
+            st.caption(f"Bottom propagation pair: {bottom_partner} -> {bottom_chain}")
+
+        if global_propagation_direction in {"Add to top", "Add to both ends"}:
+            if global_propagation_direction == "Add to both ends":
+                top_chain_options = [chain_id for chain_id in proto_chains if chain_id != bottom_chain]
+            else:
+                top_chain_options = list(proto_chains)
+            if not top_chain_options:
+                st.warning("No valid top-chain options remain after applying bottom-chain constraints.")
+                continue
+            top_chain_key = f"proto_{proto_index}_top_chain"
+            _sync_selectbox_key_to_options(top_chain_key, top_chain_options)
+            top_chain = st.selectbox(
+                f"Top chain for protofibril {proto_index}",
+                options=top_chain_options,
+                key=top_chain_key,
+            )
+            if global_propagation_direction == "Add to both ends":
+                if two_chain_mode:
+                    # Special 2-chain case: the opposite chain is the required partner.
+                    top_partner_options = [chain_id for chain_id in proto_chains if chain_id != top_chain]
+                else:
+                    top_partner_options = [
+                        chain_id for chain_id in proto_chains if chain_id not in {top_chain, bottom_chain}
+                    ]
+            else:
+                top_partner_options = [chain_id for chain_id in proto_chains if chain_id != top_chain]
+            if not top_partner_options:
+                st.warning("Select at least two distinct chains to define the top propagation pair.")
+                continue
+            if two_chain_mode:
+                top_partner = top_partner_options[0]
+            else:
+                top_partner_key = f"proto_{proto_index}_top_partner"
+                _sync_selectbox_key_to_options(top_partner_key, top_partner_options)
+                top_partner = st.selectbox(
+                    f"Chain paired with top chain for protofibril {proto_index}",
+                    options=top_partner_options,
+                    key=top_partner_key,
+                    help="This chain and the top chain define the stacking step used to extend the top end.",
+                )
+            top_reference_pair = [top_partner, top_chain]
+            st.caption(f"Top propagation pair: {top_partner} -> {top_chain}")
+
+        if global_propagation_direction == "Add to top":
+            # Keep a stable bottom anchor for membership ordering even when not growing bottom.
+            bottom_chain = next((chain_id for chain_id in proto_chains if chain_id != top_chain), proto_chains[0])
+        elif global_propagation_direction == "Add to bottom":
+            # Keep a stable top anchor for membership ordering even when not growing top.
+            top_chain = next((chain_id for chain_id in reversed(proto_chains) if chain_id != bottom_chain), proto_chains[-1])
+
+        if two_chain_mode:
+            # Special case: with exactly two kept chains, enforce reciprocal reference pairs.
+            top_reference_pair = [bottom_chain, top_chain]
+            bottom_reference_pair = [top_chain, bottom_chain]
+            st.caption(
+                "Two-chain mode: reciprocal propagation pairs are auto-assigned "
+                f"({bottom_chain} -> {top_chain} and {top_chain} -> {bottom_chain})."
+            )
+
         if global_propagation_direction == "Add to top":
             st.caption("Current run uses the top propagation pair only.")
         elif global_propagation_direction == "Add to bottom":
@@ -968,14 +1105,57 @@ def _render_step_5_review(configs: list[dict] | None = None):
     st.info("This plan updates immediately when you change anything in the steps above.")
 
 
+def _render_propagation_debug_panel():
+    debug_events = st.session_state.get("propagation_debug_events") or []
+    if not debug_events:
+        return
+    with st.expander("Propagation debug log", expanded=False):
+        st.caption(
+            f"Captured {len(debug_events)} debug events from the most recent propagation attempt."
+        )
+        st.dataframe(pd.DataFrame(debug_events), width="stretch")
+        st.code(json.dumps(debug_events, indent=2, default=str), language="json")
+
+
 def _render_propagated_model_preview(propagated_pdb: str):
     st.markdown("**Propagated Model Preview**")
     propagated_rows = chain_rows_from_pdb(propagated_pdb)
     st.caption(f"Propagated chain count: {len(propagated_rows)}")
     st.dataframe(pd.DataFrame(propagated_rows), width="stretch")
     chain_ids = [row["chain_id"] for row in propagated_rows]
-    molstar_custom_component(
-        structures=[
+    propagation_result = st.session_state.get("propagation_result_preview") or {}
+    membership_rows = propagation_result.get("protofibril_chain_membership", []) or []
+    seed_chain_ids = {
+        str(row.get("chain_id"))
+        for row in membership_rows
+        if str(row.get("origin", "")).lower() == "seed"
+    }
+    if seed_chain_ids:
+        st.caption(
+            "Original chains are highlighted in blue: "
+            f"{', '.join(sorted(seed_chain_ids))}"
+        )
+        chain_visualizations = []
+        for chain_id in chain_ids:
+            is_seed = chain_id in seed_chain_ids
+            chain_visualizations.append(
+                ChainVisualization(
+                    chain_id=chain_id,
+                    color="uniform",
+                    color_params={"value": ("0x1E88E5" if is_seed else "0xC7CEDB")},
+                    representation_type=("cartoon+ball-and-stick" if is_seed else "cartoon"),
+                    label=f"Chain {chain_id}{' (original)' if is_seed else ' (propagated)'}",
+                )
+            )
+        structures = [
+            StructureVisualization(
+                pdb=propagated_pdb,
+                representation_type="cartoon",
+                chains=chain_visualizations,
+            )
+        ]
+    else:
+        structures = [
             StructureVisualization(
                 pdb=propagated_pdb,
                 # Render the full propagated structure directly from the
@@ -985,7 +1165,9 @@ def _render_propagated_model_preview(propagated_pdb: str):
                 color="chain-id",
                 representation_type="cartoon",
             )
-        ],
+        ]
+    molstar_custom_component(
+        structures=structures,
         key=f"propagated_preview_{'_'.join(chain_ids)}",
         height=720,
         show_controls=True,
@@ -1640,7 +1822,7 @@ def _build_session_bundle_zip(uploaded_name: str, original_text: str) -> tuple[b
             optimized_mode = _optimization_mode_slug(st.session_state.get("optimized_structure_mode"))
             zf.writestr(f"structures/minimized_{optimized_mode}{optimized_suffix}", optimized_text)
 
-        if final_text:
+        if final_text and final_text not in {propagated_text, optimized_text}:
             _, final_suffix, _ = _download_metadata(uploaded_name, "final_structure", final_text)
             final_mode = _optimization_mode_slug(st.session_state.get("optimized_structure_mode"))
             zf.writestr(f"structures/final_{final_mode}{final_suffix}", final_text)
@@ -1667,21 +1849,22 @@ def _render_export_placeholder(uploaded_name: str, pdb_text: str):
             file_name=f"{propagated_name}_propagated{propagated_suffix}",
             mime=propagated_mime,
         )
-    if final_structure:
-        final_name, final_suffix, final_mime = _download_metadata(uploaded_name, "final_structure", final_structure)
-        final_source = st.session_state.get("final_structure_source")
-        optimized_mode = st.session_state.get("optimized_structure_mode")
-        if final_source == "optimized":
-            mode_slug = _optimization_mode_slug(optimized_mode)
-            final_filename = f"{final_name}_final_{mode_slug}{final_suffix}"
-            final_button_label = f"Download final structure ({mode_slug})"
-        else:
-            final_filename = f"{final_name}_final_prop{final_suffix}"
-            final_button_label = "Download final structure (prop)"
+    optimized_structure = st.session_state.get("optimized_structure_preview")
+    if optimized_structure:
+        minimized_name, minimized_suffix, minimized_mime = _download_metadata(uploaded_name, "optimized_structure", optimized_structure)
+        mode_slug = _optimization_mode_slug(st.session_state.get("optimized_structure_mode"))
         st.download_button(
-            final_button_label,
+            f"Download minimized structure ({mode_slug})",
+            data=optimized_structure,
+            file_name=f"{minimized_name}_minimized_{mode_slug}{minimized_suffix}",
+            mime=minimized_mime,
+        )
+    elif final_structure and final_structure != propagated_pdb:
+        final_name, final_suffix, final_mime = _download_metadata(uploaded_name, "final_structure", final_structure)
+        st.download_button(
+            "Download final structure",
             data=final_structure,
-            file_name=final_filename,
+            file_name=f"{final_name}_final{final_suffix}",
             mime=final_mime,
         )
     bundle_zip, bundle_name = _build_session_bundle_zip(uploaded_name, pdb_text)
@@ -1728,6 +1911,18 @@ def main():
             "Propagate",
             "Build the propagated fibril preview from the current iteration plan.",
         )
+        if SHOW_PROPAGATION_DEBUG_UI:
+            st.checkbox(
+                "Enable propagation debug mode",
+                key="propagation_debug_mode",
+                value=False,
+                help=(
+                    "Stores transform/addition/serialization diagnostics for this run. "
+                    "Useful when propagation fails with non-obvious errors."
+                ),
+            )
+        else:
+            st.session_state["propagation_debug_mode"] = False
         current_build_signature = _stable_signature(
             {
                 "keep_chain_ids": st.session_state.get("selected_kept_chains", []),
@@ -1794,6 +1989,10 @@ def main():
             status_col.info("Settings changed. Click `Build propagation preview` to update the propagated model.")
         elif st.session_state.get("propagated_pdb_preview"):
             status_col.caption("Preview is up to date with the current settings.")
+        if SHOW_PROPAGATION_DEBUG_UI and (
+            st.session_state.get("propagation_debug_mode") or st.session_state.get("propagation_debug_events")
+        ):
+            _render_propagation_debug_panel()
     if st.session_state.get("propagated_pdb_preview"):
         st.success("Propagation build finished. Download buttons are available below.")
         st.info("This preview is the rigid propagated structure. Inspect it first, then decide whether optimization is needed.")

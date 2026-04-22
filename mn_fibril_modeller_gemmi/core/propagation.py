@@ -29,6 +29,14 @@ from mn_fibril_modeller_gemmi.core.pdb_io import (
 PDB_CHAIN_IDS = string.ascii_uppercase + string.ascii_lowercase + string.digits
 
 
+def _debug_log(debug_sink: list[dict] | None, event: str, **payload):
+    if debug_sink is None:
+        return
+    record = {"event": event}
+    record.update(payload)
+    debug_sink.append(record)
+
+
 def filter_pdb_to_chains(
     pdb_text: str,
     keep_chain_ids: list[str],
@@ -86,12 +94,6 @@ def _compute_chain_transform(model, source_chain_id: str, target_chain_id: str):
     return rotation, translation, float(superimposer.rms)
 
 
-def _inverse_transform(rotation: np.ndarray, translation: np.ndarray):
-    inverse_rotation = rotation.T
-    inverse_translation = -np.dot(translation, inverse_rotation)
-    return inverse_rotation, inverse_translation
-
-
 def _next_available_chain_id(used_chain_ids: set[str], output_format: str = "pdb") -> str:
     if output_format == "mmcif":
         index = 1
@@ -145,18 +147,90 @@ def _clone_chain_with_transform_gemmi(
     # Reassign per-residue subchain and entity id explicitly.
     source_residues = [res for res in source_chain]
     cloned_residues = [res for res in cloned_chain]
+    default_entity_id = str(source_entity_id).strip() if source_entity_id is not None else ""
+    if not default_entity_id or default_entity_id in {".", "?"}:
+        default_entity_id = "1"
     for src_residue, cloned_residue in zip(source_residues, cloned_residues):
         cloned_residue.subchain = new_chain_id
+        src_entity_id = str(src_residue.entity_id).strip() if src_residue.entity_id is not None else ""
         if source_entity_id:
-            cloned_residue.entity_id = source_entity_id
-        elif src_residue.entity_id:
-            cloned_residue.entity_id = src_residue.entity_id
+            cloned_residue.entity_id = str(source_entity_id)
+        elif src_entity_id and src_entity_id not in {".", "?"}:
+            cloned_residue.entity_id = src_entity_id
+        else:
+            cloned_residue.entity_id = default_entity_id
     transform = _gemmi_transform(rotation, translation)
     for residue in cloned_chain:
         for atom in residue:
             transformed = transform.apply(atom.pos)
             atom.pos = [transformed.x, transformed.y, transformed.z]
     return cloned_chain
+
+
+def _validate_chain_coordinates(
+    chain: gemmi.Chain,
+    *,
+    proto_index: int,
+    direction: str,
+    source_chain_id: str,
+):
+    max_abs_coord = 0.0
+    for residue in chain:
+        for atom in residue:
+            x = float(atom.pos.x)
+            y = float(atom.pos.y)
+            z = float(atom.pos.z)
+            if not np.isfinite(x) or not np.isfinite(y) or not np.isfinite(z):
+                raise ValueError(
+                    f"Propagation produced non-finite coordinates while adding to {direction} "
+                    f"(protofibril {proto_index}, source chain {source_chain_id}). "
+                    "Check selected top/bottom reference pairs."
+                )
+            max_abs_coord = max(max_abs_coord, abs(x), abs(y), abs(z))
+    if max_abs_coord > 1_000_000.0:
+        raise ValueError(
+            f"Propagation transform is unstable (|coord|={max_abs_coord:.2f}) while adding to {direction} "
+            f"(protofibril {proto_index}, source chain {source_chain_id}). "
+            "This usually means the selected reference pair points in the wrong direction."
+        )
+
+
+def _chain_ca_coords(chain: gemmi.Chain) -> np.ndarray:
+    coords = []
+    for residue in chain:
+        for atom in residue:
+            if atom.name.strip() == "CA":
+                coords.append([float(atom.pos.x), float(atom.pos.y), float(atom.pos.z)])
+                break
+    if not coords:
+        return np.empty((0, 3), dtype=float)
+    return np.asarray(coords, dtype=float)
+
+
+def _detect_overlapping_chain(
+    model: gemmi.Model,
+    candidate_chain: gemmi.Chain,
+    *,
+    ignore_chain_ids: set[str],
+    min_ca_atoms: int = 8,
+    median_distance_threshold: float = 0.35,
+) -> str | None:
+    candidate_ca = _chain_ca_coords(candidate_chain)
+    if candidate_ca.shape[0] < min_ca_atoms:
+        return None
+
+    for chain in model:
+        if chain.name in ignore_chain_ids:
+            continue
+        target_ca = _chain_ca_coords(chain)
+        if target_ca.shape[0] < min_ca_atoms:
+            continue
+        deltas = candidate_ca[:, None, :] - target_ca[None, :, :]
+        distances = np.sqrt(np.sum(deltas * deltas, axis=2))
+        nearest = np.min(distances, axis=1)
+        if float(np.median(nearest)) < median_distance_threshold:
+            return chain.name
+    return None
 
 
 def _chain_entity_id_map(structure: gemmi.Structure, model: gemmi.Model) -> dict[str, str]:
@@ -177,6 +251,45 @@ def _chain_entity_id_map(structure: gemmi.Structure, model: gemmi.Model) -> dict
         if mapped_entity:
             chain_to_entity[chain.name] = mapped_entity
     return chain_to_entity
+
+
+def _mmcif_chain_sanity_summary(model: gemmi.Model) -> dict:
+    invalid_chain_names = []
+    invalid_residue_fields = []
+    chain_count = 0
+    residue_count = 0
+    atom_count = 0
+
+    for chain in model:
+        chain_count += 1
+        chain_name = str(chain.name).strip()
+        if not chain_name:
+            invalid_chain_names.append("<empty>")
+        for residue in chain:
+            residue_count += 1
+            atom_count += len(residue)
+            subchain = str(residue.subchain).strip()
+            entity_id = str(residue.entity_id).strip() if residue.entity_id is not None else ""
+            if not subchain or subchain in {".", "?"}:
+                invalid_residue_fields.append(
+                    f"{chain_name}:{residue.seqid.num} missing subchain"
+                )
+            if not entity_id or entity_id in {".", "?"}:
+                invalid_residue_fields.append(
+                    f"{chain_name}:{residue.seqid.num} missing entity_id"
+                )
+            if len(invalid_residue_fields) >= 8:
+                break
+        if len(invalid_residue_fields) >= 8:
+            break
+
+    return {
+        "chain_count": chain_count,
+        "residue_count": residue_count,
+        "atom_count": atom_count,
+        "invalid_chain_names": invalid_chain_names[:8],
+        "invalid_residue_examples": invalid_residue_fields[:8],
+    }
 
 
 def _serialize_structure(structure, output_format: str = "pdb") -> str:
@@ -510,9 +623,22 @@ def build_propagated_model(
     protofibril_configs: list[dict],
     structure_format: str | None = None,
     progress_callback=None,
+    debug_mode: bool = False,
+    debug_sink: list[dict] | None = None,
 ) -> dict:
+    if not debug_mode:
+        debug_sink = None
+
     input_format = detect_structure_format(pdb_text, structure_format)
     output_format = "mmcif"
+    _debug_log(
+        debug_sink,
+        "propagation_start",
+        input_format=input_format,
+        requested_keep_chain_count=len(keep_chain_ids),
+        protofibril_count=len(protofibril_configs),
+        output_format=output_format,
+    )
     assigned_chain_counts = {len(config["chains"]) for config in protofibril_configs if config.get("chains")}
     if len(assigned_chain_counts) > 1:
         raise ValueError(
@@ -531,6 +657,12 @@ def build_propagated_model(
     ]
     if not modeled_chain_ids:
         modeled_chain_ids = keep_chain_ids
+    _debug_log(
+        debug_sink,
+        "modeled_chains",
+        modeled_chain_ids=modeled_chain_ids,
+        modeled_chain_count=len(modeled_chain_ids),
+    )
     kept_structure_text = filter_pdb_to_chains(
         pdb_text,
         modeled_chain_ids,
@@ -552,6 +684,12 @@ def build_propagated_model(
     gemmi_model = gemmi_structure[0]
     chain_entity_map = _chain_entity_id_map(gemmi_structure, gemmi_model)
     used_chain_ids = {chain.name for chain in gemmi_model}
+    _debug_log(
+        debug_sink,
+        "post_filter_structure",
+        kept_chain_count=len(used_chain_ids),
+        kept_chain_ids=sorted(list(used_chain_ids)),
+    )
 
     propagation_metadata = []
     transforms = {}
@@ -567,9 +705,27 @@ def build_propagated_model(
         if len(top_pair) == 2:
             top_rotation, top_translation, top_rms = _compute_chain_transform(biopython_model, top_pair[0], top_pair[1])
             top_transform = (top_rotation, top_translation)
+            _debug_log(
+                debug_sink,
+                "transform_top",
+                protofibril_index=proto_index,
+                source=top_pair[0],
+                target=top_pair[1],
+                rms=float(top_rms),
+                translation_norm=float(np.linalg.norm(top_translation)),
+            )
         if len(bottom_pair) == 2:
             bottom_rotation, bottom_translation, bottom_rms = _compute_chain_transform(biopython_model, bottom_pair[0], bottom_pair[1])
-            bottom_transform = _inverse_transform(bottom_rotation, bottom_translation)
+            bottom_transform = (bottom_rotation, bottom_translation)
+            _debug_log(
+                debug_sink,
+                "transform_bottom",
+                protofibril_index=proto_index,
+                source=bottom_pair[0],
+                target=bottom_pair[1],
+                rms=float(bottom_rms),
+                translation_norm=float(np.linalg.norm(bottom_translation)),
+            )
 
         transforms[proto_index] = {
             "top": top_transform,
@@ -626,17 +782,156 @@ def build_propagated_model(
                 rotation, translation = top_transform
                 for _ in range(addition_unit):
                     source_chain = _find_gemmi_chain(gemmi_model, current_edges[proto_index]["top_chain_id"])
+                    source_chain_id = source_chain.name
                     new_chain_id = _next_available_chain_id(used_chain_ids, output_format)
+                    _debug_log(
+                        debug_sink,
+                        "addition_top_start",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
                     cloned_chain = _clone_chain_with_transform_gemmi(
                         source_chain,
                         new_chain_id,
                         rotation,
                         translation,
-                        source_entity_id=chain_entity_map.get(source_chain.name),
+                        source_entity_id=chain_entity_map.get(source_chain_id),
                     )
-                    gemmi_model.add_chain(cloned_chain)
-                    if source_chain.name in chain_entity_map:
-                        chain_entity_map[new_chain_id] = chain_entity_map[source_chain.name]
+                    _debug_log(
+                        debug_sink,
+                        "addition_top_cloned",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
+                    _debug_log(
+                        debug_sink,
+                        "addition_top_pre_validate",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
+                    try:
+                        _validate_chain_coordinates(
+                            cloned_chain,
+                            proto_index=proto_index,
+                            direction="top",
+                            source_chain_id=source_chain_id,
+                        )
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_post_validate",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_validate_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Top addition validation failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    try:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_pre_overlap_check",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                        overlapping_chain_id = _detect_overlapping_chain(
+                            gemmi_model,
+                            cloned_chain,
+                            ignore_chain_ids={source_chain_id},
+                        )
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_post_overlap_check",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            overlapping_chain_id=overlapping_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_overlap_check_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Top overlap check failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    if overlapping_chain_id is not None:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_overlap",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            overlapping_chain_id=overlapping_chain_id,
+                        )
+                        raise ValueError(
+                            f"Top growth for protofibril {proto_index} would place a new chain on top of existing "
+                            f"chain {overlapping_chain_id}. Adjust top chain/reference selection."
+                        )
+                    try:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_pre_add_chain",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                        gemmi_model.add_chain(cloned_chain)
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_post_add_chain",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_top_add_chain_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Top add-chain failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    if source_chain_id in chain_entity_map:
+                        chain_entity_map[new_chain_id] = chain_entity_map[source_chain_id]
                     used_chain_ids.add(new_chain_id)
                     current_edges[proto_index]["top_chain_id"] = new_chain_id
                     protofibril_chain_order[proto_index].append(new_chain_id)
@@ -645,9 +940,17 @@ def build_propagated_model(
                             "protofibril_index": proto_index,
                             "iteration": iteration,
                             "direction": "top",
-                            "source_chain_id": source_chain.name,
+                            "source_chain_id": source_chain_id,
                             "new_chain_id": new_chain_id,
                         }
+                    )
+                    _debug_log(
+                        debug_sink,
+                        "addition_top",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
                     )
 
             if direction in {"Add to bottom", "Add to both ends"}:
@@ -656,17 +959,156 @@ def build_propagated_model(
                 rotation, translation = bottom_transform
                 for _ in range(addition_unit):
                     source_chain = _find_gemmi_chain(gemmi_model, current_edges[proto_index]["bottom_chain_id"])
+                    source_chain_id = source_chain.name
                     new_chain_id = _next_available_chain_id(used_chain_ids, output_format)
+                    _debug_log(
+                        debug_sink,
+                        "addition_bottom_start",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
                     cloned_chain = _clone_chain_with_transform_gemmi(
                         source_chain,
                         new_chain_id,
                         rotation,
                         translation,
-                        source_entity_id=chain_entity_map.get(source_chain.name),
+                        source_entity_id=chain_entity_map.get(source_chain_id),
                     )
-                    gemmi_model.add_chain(cloned_chain)
-                    if source_chain.name in chain_entity_map:
-                        chain_entity_map[new_chain_id] = chain_entity_map[source_chain.name]
+                    _debug_log(
+                        debug_sink,
+                        "addition_bottom_cloned",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
+                    _debug_log(
+                        debug_sink,
+                        "addition_bottom_pre_validate",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
+                    )
+                    try:
+                        _validate_chain_coordinates(
+                            cloned_chain,
+                            proto_index=proto_index,
+                            direction="bottom",
+                            source_chain_id=source_chain_id,
+                        )
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_post_validate",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_validate_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Bottom addition validation failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    try:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_pre_overlap_check",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                        overlapping_chain_id = _detect_overlapping_chain(
+                            gemmi_model,
+                            cloned_chain,
+                            ignore_chain_ids={source_chain_id},
+                        )
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_post_overlap_check",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            overlapping_chain_id=overlapping_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_overlap_check_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Bottom overlap check failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    if overlapping_chain_id is not None:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_overlap",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            overlapping_chain_id=overlapping_chain_id,
+                        )
+                        raise ValueError(
+                            f"Bottom growth for protofibril {proto_index} would place a new chain on top of existing "
+                            f"chain {overlapping_chain_id}. Adjust bottom chain/reference selection."
+                        )
+                    try:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_pre_add_chain",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                        gemmi_model.add_chain(cloned_chain)
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_post_add_chain",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                        )
+                    except Exception as exc:
+                        _debug_log(
+                            debug_sink,
+                            "addition_bottom_add_chain_failed",
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            source_chain_id=source_chain_id,
+                            new_chain_id=new_chain_id,
+                            error_type=type(exc).__name__,
+                            error_message=str(exc),
+                        )
+                        raise RuntimeError(
+                            f"Bottom add-chain failed at iteration {iteration} "
+                            f"(protofibril {proto_index}, source {source_chain_id}, new {new_chain_id}): {exc}"
+                        ) from exc
+                    if source_chain_id in chain_entity_map:
+                        chain_entity_map[new_chain_id] = chain_entity_map[source_chain_id]
                     used_chain_ids.add(new_chain_id)
                     current_edges[proto_index]["bottom_chain_id"] = new_chain_id
                     protofibril_chain_order[proto_index].insert(0, new_chain_id)
@@ -675,9 +1117,17 @@ def build_propagated_model(
                             "protofibril_index": proto_index,
                             "iteration": iteration,
                             "direction": "bottom",
-                            "source_chain_id": source_chain.name,
+                            "source_chain_id": source_chain_id,
                             "new_chain_id": new_chain_id,
                         }
+                    )
+                    _debug_log(
+                        debug_sink,
+                        "addition_bottom",
+                        protofibril_index=proto_index,
+                        iteration=iteration,
+                        source_chain_id=source_chain_id,
+                        new_chain_id=new_chain_id,
                     )
             completed_progress_steps += 1
 
@@ -710,7 +1160,41 @@ def build_propagated_model(
                 }
             )
 
-    serialized_structure = serialize_structure_gemmi(gemmi_structure, output_format)
+    pre_serialize_atom_count = 0
+    pre_serialize_residue_count = 0
+    pre_serialize_chain_count = 0
+    for chain in gemmi_model:
+        pre_serialize_chain_count += 1
+        for residue in chain:
+            pre_serialize_residue_count += 1
+            pre_serialize_atom_count += len(residue)
+    _debug_log(
+        debug_sink,
+        "pre_serialize",
+        chain_count=pre_serialize_chain_count,
+        residue_count=pre_serialize_residue_count,
+        atom_count=pre_serialize_atom_count,
+        output_format=output_format,
+    )
+
+    try:
+        serialized_structure = serialize_structure_gemmi(gemmi_structure, output_format)
+    except Exception as exc:
+        sanity = _mmcif_chain_sanity_summary(gemmi_model)
+        _debug_log(
+            debug_sink,
+            "serialize_failed",
+            error_type=type(exc).__name__,
+            error_message=str(exc),
+            chain_count=pre_serialize_chain_count,
+            residue_count=pre_serialize_residue_count,
+            atom_count=pre_serialize_atom_count,
+            mmcif_sanity=sanity,
+        )
+        raise RuntimeError(
+            f"Failed to serialize propagated {output_format} structure: {type(exc).__name__}: {exc}. "
+            f"Sanity: {sanity}"
+        ) from exc
 
     return {
         "pdb": serialized_structure,

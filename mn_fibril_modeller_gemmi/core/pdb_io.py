@@ -210,7 +210,24 @@ def _strip_secondary_structure_annotations(structure_text: str, output_format: s
 
 def serialize_structure_gemmi(structure: gemmi.Structure, output_format: str = "mmcif") -> str:
     if output_format == "mmcif":
-        document = structure.make_mmcif_document()
+        structure_for_write = structure.clone()
+        for model in structure_for_write:
+            for chain in model:
+                chain_name = str(chain.name).strip()
+                if not chain_name:
+                    chain_name = "X"
+                chain.name = chain_name
+                for residue in chain:
+                    residue.subchain = chain_name
+                    entity_id = str(residue.entity_id).strip() if residue.entity_id is not None else ""
+                    if not entity_id or entity_id in {".", "?"}:
+                        residue.entity_id = "1"
+        structure_for_write.remove_empty_chains()
+        # Keep Gemmi's entity/asym mapping coherent for generated chains.
+        structure_for_write.setup_entities()
+        structure_for_write.add_entity_types()
+        structure_for_write.add_entity_ids()
+        document = structure_for_write.make_mmcif_document()
         return _strip_secondary_structure_annotations(document.as_string(), output_format)
     return _strip_secondary_structure_annotations(structure.make_pdb_string(), output_format)
 
