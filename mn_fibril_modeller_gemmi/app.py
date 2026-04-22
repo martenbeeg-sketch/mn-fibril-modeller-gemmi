@@ -449,7 +449,7 @@ def _render_structure_viewer(pdb_text: str, chain_rows):
                 chain_id=chain_id,
                 color="uniform",
                 color_params={"value": (color_map[chain_id] if is_selected else "#C7CEDB").replace("#", "0x")},
-                representation_type="cartoon+ball-and-stick" if is_selected else "cartoon",
+                representation_type="cartoon",
                 label=f"Chain {chain_id}",
             )
         )
@@ -504,7 +504,7 @@ def _render_protofibril_assignment_viewer(pdb_text: str, chain_rows, protofibril
                 chain_id=chain_id,
                 color="uniform",
                 color_params={"value": color.replace("#", "0x")},
-                representation_type="cartoon+ball-and-stick" if chain_id in assigned_chain_to_color else "cartoon",
+                representation_type="cartoon",
                 label=f"Chain {chain_id}",
             )
         )
@@ -593,13 +593,10 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
         top_bottom_representation = "cartoon"
         if chain_id in highlighted_reference:
             top_bottom_color = TRANSFORM_CHAIN_COLOR
-            top_bottom_representation = "cartoon+ball-and-stick"
         if chain_id in highlighted_bottom:
             top_bottom_color = BOTTOM_CHAIN_COLOR
-            top_bottom_representation = "cartoon+ball-and-stick"
         if chain_id in highlighted_top:
             top_bottom_color = TOP_CHAIN_COLOR
-            top_bottom_representation = "cartoon+ball-and-stick"
         top_bottom_visualizations.append(
             ChainVisualization(
                 chain_id=chain_id,
@@ -614,7 +611,6 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
         reference_representation = "cartoon"
         if chain_id in highlighted_propagated:
             reference_color = TRANSFORM_CHAIN_COLOR
-            reference_representation = "cartoon+ball-and-stick"
         reference_visualizations.append(
             ChainVisualization(
                 chain_id=chain_id,
@@ -637,6 +633,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
     )
     growth_key_suffix = _stable_key_suffix(
         {
+            "pdb_signature": _structure_signature(pdb_text),
             "chain_ids": chain_ids,
             "highlighted_top": sorted(highlighted_top),
             "highlighted_bottom": sorted(highlighted_bottom),
@@ -680,7 +677,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
             height=viewer_height,
             width="100%",
             show_controls=True,
-            force_reload=False,
+            force_reload=True,
         )
 
     with right:
@@ -697,7 +694,7 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
             height=viewer_height,
             width="100%",
             show_controls=True,
-            force_reload=False,
+            force_reload=True,
         )
 
 
@@ -819,8 +816,7 @@ def _render_step_3_define_propagation(pdb_text: str, chain_rows):
         )
     if not duplicate_chains and not unassigned_chains and any(proto["chains"] for proto in protofibrils):
         st.success("All kept chains are assigned exactly once.")
-    with st.expander("Show protofibril assignment viewer", expanded=False):
-        _render_protofibril_assignment_viewer(pdb_text, chain_rows, protofibrils)
+    _render_protofibril_assignment_viewer(pdb_text, chain_rows, protofibrils)
 
     return {
         "kept_chains": chain_ids,
@@ -1058,8 +1054,7 @@ def _render_step_4_build(chain_rows):
 
     if configs:
         st.info("Propagation builds the rigid fibril geometry only. Inspection and optional optimization happen afterward.")
-        with st.expander("Show growth selection viewers", expanded=False):
-            _render_growth_selection_viewer(st.session_state.get("current_pdb_text", ""), chain_rows, configs)
+        _render_growth_selection_viewer(st.session_state.get("current_pdb_text", ""), chain_rows, configs)
     return {
         "protofibril_configs": configs,
         "global_units_to_add": int(global_units_to_add),
@@ -1159,7 +1154,7 @@ def _render_propagated_model_preview(propagated_pdb: str):
                     chain_id=chain_id,
                     color="uniform",
                     color_params={"value": ("0x1E88E5" if is_seed else "0xC7CEDB")},
-                    representation_type=("cartoon+ball-and-stick" if is_seed else "cartoon"),
+                    representation_type="cartoon",
                     label=f"Chain {chain_id}{' (original)' if is_seed else ' (propagated)'}",
                 )
             )
