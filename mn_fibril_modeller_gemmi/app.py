@@ -1583,6 +1583,7 @@ def _build_session_bundle_zip(uploaded_name: str, original_text: str) -> tuple[b
     propagated_text = st.session_state.get("propagated_pdb_preview")
     optimized_text = st.session_state.get("optimized_structure_preview")
     final_text = _get_final_structure_text()
+    protofibril_configs = st.session_state.get("protofibril_configs_preview", [])
 
     propagation_result = st.session_state.get("propagation_result_preview") or {}
     propagation_result_meta = {
@@ -1623,6 +1624,16 @@ def _build_session_bundle_zip(uploaded_name: str, original_text: str) -> tuple[b
         if propagated_text:
             _, propagated_suffix, _ = _download_metadata(uploaded_name, "propagated_structure", propagated_text)
             zf.writestr(f"structures/propagated{propagated_suffix}", propagated_text)
+            try:
+                merged_text = build_merged_protofibril_visualization_pdb(
+                    pdb_text=propagated_text,
+                    protofibril_configs=protofibril_configs,
+                    protofibril_chain_membership=propagation_result.get("protofibril_chain_membership", []),
+                    residue_gap=MERGED_RESIDUE_GAP,
+                )
+                zf.writestr("structures/propagated_merged_single_chain.pdb", merged_text)
+            except Exception as exc:
+                zf.writestr("structures/propagated_merged_single_chain_error.txt", _format_exception_message(exc))
 
         if optimized_text:
             _, optimized_suffix, _ = _download_metadata(uploaded_name, "optimized_structure", optimized_text)
@@ -1680,41 +1691,8 @@ def _render_export_placeholder(uploaded_name: str, pdb_text: str):
         file_name=bundle_name,
         mime="application/zip",
     )
-    merged_pdb = st.session_state.get("merged_protofibril_pdb_preview")
-    merged_backend = st.session_state.get("merged_protofibril_backend")
-    merged_backend_reason = st.session_state.get("merged_protofibril_backend_fallback_reason")
-    prepare_requested = st.session_state.get("prepare_merged_protofibril_export_requested", False)
     if final_structure:
         _render_merged_export_feedback()
-    if final_structure and not merged_pdb and prepare_requested:
-        try:
-            _run_merged_export_with_feedback(final_structure)
-            st.session_state["prepare_merged_protofibril_export_requested"] = False
-            st.rerun()
-        except Exception as exc:
-            st.session_state["prepare_merged_protofibril_export_requested"] = False
-            st.error(f"Preparing the merged export failed: {_format_exception_message(exc)}")
-    if final_structure and not merged_pdb:
-        st.button(
-            "Prepare merged protofibril export",
-            key="prepare_merged_protofibril_export",
-            width="stretch",
-            on_click=_request_prepare_merged_export,
-        )
-    if merged_pdb:
-        if merged_backend == "biopython":
-            st.success("Merged export backend: biopython")
-        elif merged_backend:
-            st.info(f"Merged export backend: {merged_backend}")
-        if merged_backend_reason:
-            st.caption(merged_backend_reason)
-        merged_name, merged_suffix, merged_mime = _download_metadata(uploaded_name, "merged_structure", merged_pdb)
-        st.download_button(
-            "Download merged protofibril structure",
-            data=merged_pdb,
-            file_name=f"{merged_name}_merged_protofibrils{merged_suffix}",
-            mime=merged_mime,
-        )
 
 
 def main():
@@ -1819,10 +1797,7 @@ def main():
     if st.session_state.get("propagated_pdb_preview"):
         st.success("Propagation build finished. Download buttons are available below.")
         st.info("This preview is the rigid propagated structure. Inspect it first, then decide whether optimization is needed.")
-        if st.session_state.get("prepare_merged_protofibril_export_requested"):
-            st.caption("Skipping propagated viewer redraw while preparing the merged export.")
-        else:
-            _render_propagated_model_preview(st.session_state["propagated_pdb_preview"])
+        _render_propagated_model_preview(st.session_state["propagated_pdb_preview"])
         _render_propagated_membership_table()
         _render_step_7_inspect()
         _render_step_8_optimize()
