@@ -982,12 +982,15 @@ def _render_step_4_build(chain_rows):
                 st.session_state["global_helical_twist"] = float(helical_metadata["angle_deg_per_subunit"])
                 st.session_state["global_helical_rise"] = float(helical_metadata["rise_angstrom_per_subunit"])
                 st.session_state["helical_defaults_signature"] = metadata_signature
+            if "global_helical_twist" not in st.session_state:
+                st.session_state["global_helical_twist"] = float(helical_metadata["angle_deg_per_subunit"])
+            if "global_helical_rise" not in st.session_state:
+                st.session_state["global_helical_rise"] = float(helical_metadata["rise_angstrom_per_subunit"])
 
             helical_input_cols = st.columns(2, gap="medium")
             with helical_input_cols[0]:
                 global_helical_twist = st.number_input(
                     "Helical twist (deg per subunit)",
-                    value=float(st.session_state.get("global_helical_twist", helical_metadata["angle_deg_per_subunit"])),
                     step=0.0001,
                     format="%.4f",
                     key="global_helical_twist",
@@ -996,7 +999,6 @@ def _render_step_4_build(chain_rows):
             with helical_input_cols[1]:
                 global_helical_rise = st.number_input(
                     "Helical rise (A per subunit)",
-                    value=float(st.session_state.get("global_helical_rise", helical_metadata["rise_angstrom_per_subunit"])),
                     step=0.0001,
                     format="%.4f",
                     key="global_helical_rise",
@@ -2029,6 +2031,18 @@ def _render_export_placeholder(uploaded_name: str, pdb_text: str):
             file_name=f"{propagated_name}_propagated{propagated_suffix}",
             mime=propagated_mime,
         )
+    merged_structure = st.session_state.get("merged_protofibril_pdb_preview")
+    if merged_structure:
+        merged_name, merged_suffix, merged_mime = _download_metadata(uploaded_name, "merged_structure", merged_structure)
+        st.download_button(
+            "Download merged structure (single chain per protofibril)",
+            data=merged_structure,
+            file_name=f"{merged_name}_propagated_merged_single_chain{merged_suffix}",
+            mime=merged_mime,
+        )
+        merged_backend = st.session_state.get("merged_protofibril_backend")
+        if merged_backend:
+            st.caption(f"Merged export backend: {merged_backend}.")
     optimized_structure = st.session_state.get("optimized_structure_preview")
     if optimized_structure:
         minimized_name, minimized_suffix, minimized_mime = _download_metadata(uploaded_name, "optimized_structure", optimized_structure)
@@ -2141,11 +2155,20 @@ def main():
         elif build_clicked:
             try:
                 propagation_result = _run_propagation_with_feedback(pdb_text, build_settings)
-                st.session_state["merged_protofibril_pdb_preview"] = None
-                st.session_state["merged_protofibril_backend"] = None
-                st.session_state["merged_protofibril_backend_fallback_reason"] = None
                 st.session_state["built_build_signature"] = current_build_signature
-                status_col.success("Propagation preview rebuilt with the current settings.")
+                try:
+                    _run_merged_export_with_feedback(propagation_result["pdb"])
+                    status_col.success(
+                        "Propagation preview rebuilt and merged export generated with the current settings."
+                    )
+                except Exception as merge_exc:
+                    st.session_state["merged_protofibril_pdb_preview"] = None
+                    st.session_state["merged_protofibril_backend"] = None
+                    st.session_state["merged_protofibril_backend_fallback_reason"] = None
+                    status_col.warning(
+                        "Propagation preview rebuilt, but merged export generation failed: "
+                        f"{_format_exception_message(merge_exc)}"
+                    )
             except Exception as exc:
                 st.session_state["propagated_pdb_preview"] = None
                 st.session_state["propagation_result_preview"] = None
