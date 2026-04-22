@@ -1,5 +1,8 @@
-from mn_fibril_modeller_gemmi.core.pdb_io import chain_centroids_from_pdb
+import pytest
+
+from mn_fibril_modeller_gemmi.core.pdb_io import chain_centroids_from_pdb, parse_structure_gemmi, serialize_structure_gemmi
 from mn_fibril_modeller_gemmi.core.propagation import (
+    _extract_helical_metadata_from_mmcif_text,
     build_merged_protofibril_visualization_pdb,
     build_merged_protofibril_visualization_result,
     build_propagated_model,
@@ -19,6 +22,21 @@ ATOM      8  O   GLY B   1       0.000   0.000   8.000  1.00 20.00           O
 TER
 END
 """
+
+
+def _inject_em_helical_metadata(mmcif_text: str, *, angle_deg: float, rise_angstrom: float, symmetry: str = "C1") -> str:
+    lines = mmcif_text.splitlines()
+    if not lines:
+        return mmcif_text
+    header = lines[0]
+    tail = lines[1:]
+    metadata_lines = [
+        f"_em_helical_entity.axial_symmetry {symmetry}",
+        f"_em_helical_entity.angular_rotation_per_subunit {angle_deg}",
+        f"_em_helical_entity.axial_rise_per_subunit {rise_angstrom}",
+    ]
+    merged = [header, *metadata_lines, *tail]
+    return "\n".join(merged) + ("\n" if mmcif_text.endswith("\n") else "")
 
 
 def test_build_propagated_model_adds_chain_to_top():
@@ -155,3 +173,102 @@ def test_build_propagated_model_switches_to_mmcif_when_chain_count_exceeds_pdb_l
         structure_format="pdb",
     )
     assert result["structure_format"] == "mmcif"
+
+
+def test_extract_helical_metadata_from_mmcif_text():
+    mmcif_text = """\
+data_test
+_em_helical_entity.axial_symmetry C1
+_em_helical_entity.angular_rotation_per_subunit -1.19
+_em_helical_entity.axial_rise_per_subunit 4.78
+"""
+    metadata = _extract_helical_metadata_from_mmcif_text(mmcif_text)
+    assert metadata is not None
+    assert metadata["axial_symmetry"] == "C1"
+    assert metadata["angle_deg_per_subunit"] == -1.19
+    assert metadata["rise_angstrom_per_subunit"] == 4.78
+
+
+def test_build_propagated_model_helical_mode_requires_mmcif():
+    with pytest.raises(ValueError, match="requires mmCIF input"):
+        build_propagated_model(
+            pdb_text=LINEAR_STACK_PDB,
+            keep_chain_ids=["A", "B"],
+            protofibril_configs=[
+                {
+                    "protofibril_index": 1,
+                    "chains": ["A", "B"],
+                    "top_chain": "B",
+                    "bottom_chain": "A",
+                    "top_reference_pair": ["A", "B"],
+                    "bottom_reference_pair": [],
+                    "addition_unit": 1,
+                    "propagation_direction": "Add to top",
+                    "units_to_add": 1,
+                    "transform_mode": "helical_metadata",
+                }
+            ],
+            structure_format="pdb",
+        )
+
+
+def test_build_propagated_model_helical_mode_uses_mmcif_helical_metadata():
+    base_structure = parse_structure_gemmi(LINEAR_STACK_PDB, "pdb")
+    mmcif_text = serialize_structure_gemmi(base_structure, "mmcif")
+    mmcif_with_helical = _inject_em_helical_metadata(mmcif_text, angle_deg=0.0, rise_angstrom=5.0)
+
+    result = build_propagated_model(
+        pdb_text=mmcif_with_helical,
+        keep_chain_ids=["A", "B"],
+        protofibril_configs=[
+            {
+                "protofibril_index": 1,
+                "chains": ["A", "B"],
+                "top_chain": "B",
+                "bottom_chain": "A",
+                "top_reference_pair": ["A", "B"],
+                "bottom_reference_pair": [],
+                "addition_unit": 1,
+                "propagation_direction": "Add to top",
+                "units_to_add": 1,
+                "transform_mode": "helical_metadata",
+            }
+        ],
+        structure_format="mmcif",
+    )
+    centroids = chain_centroids_from_pdb(result["pdb"], "mmcif")
+    assert set(centroids) == {"A", "B", "PF1"}
+    assert centroids["A"][2] < centroids["B"][2] < centroids["PF1"][2]
+
+
+def test_build_propagated_model_helical_mode_uses_manual_override_values():
+    base_structure = parse_structure_gemmi(LINEAR_STACK_PDB, "pdb")
+    mmcif_text = serialize_structure_gemmi(base_structure, "mmcif")
+    mmcif_with_helical = _inject_em_helical_metadata(mmcif_text, angle_deg=0.0, rise_angstrom=5.0)
+
+    result = build_propagated_model(
+        pdb_text=mmcif_with_helical,
+        keep_chain_ids=["A", "B"],
+        protofibril_configs=[
+            {
+                "protofibril_index": 1,
+                "chains": ["A", "B"],
+                "top_chain": "B",
+                "bottom_chain": "A",
+                "top_reference_pair": ["A", "B"],
+                "bottom_reference_pair": [],
+                "addition_unit": 1,
+                "propagation_direction": "Add to top",
+                "units_to_add": 1,
+                "transform_mode": "helical_metadata",
+                "helical_twist_deg_per_subunit": 0.0,
+                "helical_rise_angstrom_per_subunit": 10.0,
+            }
+        ],
+        structure_format="mmcif",
+    )
+    metadata = result["propagation_metadata"][0]["helical_parameters"]
+    assert metadata is not None
+    assert metadata["angle_deg_per_subunit"] == 0.0
+    assert metadata["rise_angstrom_per_subunit"] == 10.0
+    assert metadata["top_rise_angstrom"] == 10.0

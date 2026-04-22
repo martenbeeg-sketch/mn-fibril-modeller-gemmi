@@ -5,6 +5,7 @@ import json
 import hashlib
 import zipfile
 
+import gemmi
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -100,6 +101,44 @@ def _format_exception_message(exc: Exception) -> str:
     if message:
         return message
     return f"{type(exc).__name__}: {exc!r}"
+
+
+def _extract_helical_metadata_for_ui(structure_text: str) -> dict[str, object] | None:
+    try:
+        document = gemmi.cif.read_string(structure_text)
+        block = document.sole_block()
+    except Exception:
+        return None
+
+    def _first_value(tag: str) -> str | None:
+        try:
+            values = block.find_values(tag)
+        except Exception:
+            return None
+        if not values:
+            return None
+        value = str(values[0]).strip()
+        if not value or value in {".", "?"}:
+            return None
+        return value
+
+    angle_text = _first_value("_em_helical_entity.angular_rotation_per_subunit")
+    rise_text = _first_value("_em_helical_entity.axial_rise_per_subunit")
+    symmetry_text = _first_value("_em_helical_entity.axial_symmetry")
+    if angle_text is None or rise_text is None:
+        return None
+    try:
+        angle_deg = float(angle_text)
+        rise_angstrom = float(rise_text)
+    except (TypeError, ValueError):
+        return None
+    return {
+        "angle_raw_text": angle_text,
+        "rise_raw_text": rise_text,
+        "angle_deg_per_subunit": angle_deg,
+        "rise_angstrom_per_subunit": rise_angstrom,
+        "axial_symmetry": symmetry_text,
+    }
 
 
 def _as_optional_float(value):
@@ -886,6 +925,93 @@ def _render_step_4_build(chain_rows):
     )
     current_structure_format = st.session_state.get("current_structure_format", "pdb")
 
+    transform_mode_options = ["chain_fit"]
+    transform_mode_help = (
+        "Chain-fit mode derives transforms from selected reference chain pairs. "
+        "This is the current default behavior."
+    )
+    if current_structure_format == "mmcif":
+        transform_mode_options.append("helical_metadata")
+        transform_mode_help = (
+            "Choose how propagation transforms are derived. "
+            "Helical metadata mode uses _em_helical_entity rise/twist values from the uploaded mmCIF."
+        )
+    previous_transform_mode = st.session_state.get("global_transform_mode", "chain_fit")
+    if previous_transform_mode not in transform_mode_options:
+        previous_transform_mode = "chain_fit"
+        st.session_state["global_transform_mode"] = "chain_fit"
+    global_transform_mode = st.radio(
+        "Transform source for all protofibrils",
+        options=transform_mode_options,
+        format_func=lambda mode: (
+            "Chain-fit from selected pairs"
+            if mode == "chain_fit"
+            else "Helical metadata from mmCIF (experimental)"
+        ),
+        index=transform_mode_options.index(previous_transform_mode),
+        key="global_transform_mode",
+        help=transform_mode_help,
+    )
+    global_helical_twist = None
+    global_helical_rise = None
+    if global_transform_mode == "helical_metadata":
+        current_text = st.session_state.get("current_pdb_text", "")
+        helical_metadata = _extract_helical_metadata_for_ui(current_text) if current_text else None
+        if helical_metadata is None:
+            st.warning(
+                "No valid mmCIF helical metadata found. "
+                "Expected _em_helical_entity.angular_rotation_per_subunit and "
+                "_em_helical_entity.axial_rise_per_subunit."
+            )
+        else:
+            st.caption(
+                "Helical metadata mode uses deposited mmCIF helical values and estimates the fibril axis "
+                "from the configured protofibril chains."
+            )
+            metadata_signature = _stable_key_suffix(
+                {
+                    "text_len": len(current_text),
+                    "text_sha1": hashlib.sha1(current_text.encode("utf-8")).hexdigest(),
+                    "angle_raw": helical_metadata.get("angle_raw_text"),
+                    "rise_raw": helical_metadata.get("rise_raw_text"),
+                    "symmetry": helical_metadata.get("axial_symmetry"),
+                },
+                length=16,
+            )
+            if st.session_state.get("helical_defaults_signature") != metadata_signature:
+                st.session_state["global_helical_twist"] = float(helical_metadata["angle_deg_per_subunit"])
+                st.session_state["global_helical_rise"] = float(helical_metadata["rise_angstrom_per_subunit"])
+                st.session_state["helical_defaults_signature"] = metadata_signature
+
+            helical_input_cols = st.columns(2, gap="medium")
+            with helical_input_cols[0]:
+                global_helical_twist = st.number_input(
+                    "Helical twist (deg per subunit)",
+                    value=float(st.session_state.get("global_helical_twist", helical_metadata["angle_deg_per_subunit"])),
+                    step=0.0001,
+                    format="%.4f",
+                    key="global_helical_twist",
+                    help="Edit the deposited mmCIF twist value used by propagation.",
+                )
+            with helical_input_cols[1]:
+                global_helical_rise = st.number_input(
+                    "Helical rise (A per subunit)",
+                    value=float(st.session_state.get("global_helical_rise", helical_metadata["rise_angstrom_per_subunit"])),
+                    step=0.0001,
+                    format="%.4f",
+                    key="global_helical_rise",
+                    help="Edit the deposited mmCIF rise value used by propagation.",
+                )
+            st.caption(
+                f"Using: twist = {float(global_helical_twist):.4f}° per subunit, "
+                f"rise = {float(global_helical_rise):.4f} A per subunit, "
+                f"axial symmetry = {helical_metadata.get('axial_symmetry') or 'n/a'}."
+            )
+            st.caption(
+                f"Raw CIF values: twist = {helical_metadata.get('angle_raw_text')}, "
+                f"rise = {helical_metadata.get('rise_raw_text')}."
+            )
+
     active_protofibril_count = sum(
         1
         for proto_index in range(1, protofibril_count + 1)
@@ -1038,19 +1164,22 @@ def _render_step_4_build(chain_rows):
         projected_growth = int(global_units_to_add) * int(per_iteration_growth)
         st.caption(f"Protofibril {proto_index} projected added chains: {projected_growth}")
 
-        configs.append(
-            {
-                "protofibril_index": proto_index,
-                "chains": proto_chains,
-                "top_chain": top_chain,
-                "bottom_chain": bottom_chain,
-                "top_reference_pair": top_reference_pair,
-                "bottom_reference_pair": bottom_reference_pair,
-                "addition_unit": int(global_addition_unit),
-                "propagation_direction": global_propagation_direction,
-                "units_to_add": int(global_units_to_add),
-            }
-        )
+        config = {
+            "protofibril_index": proto_index,
+            "chains": proto_chains,
+            "top_chain": top_chain,
+            "bottom_chain": bottom_chain,
+            "top_reference_pair": top_reference_pair,
+            "bottom_reference_pair": bottom_reference_pair,
+            "addition_unit": int(global_addition_unit),
+            "propagation_direction": global_propagation_direction,
+            "units_to_add": int(global_units_to_add),
+            "transform_mode": global_transform_mode,
+        }
+        if global_transform_mode == "helical_metadata" and global_helical_twist is not None and global_helical_rise is not None:
+            config["helical_twist_deg_per_subunit"] = float(global_helical_twist)
+            config["helical_rise_angstrom_per_subunit"] = float(global_helical_rise)
+        configs.append(config)
 
     if configs:
         st.info("Propagation builds the rigid fibril geometry only. Inspection and optional optimization happen afterward.")
@@ -1060,6 +1189,7 @@ def _render_step_4_build(chain_rows):
         "global_units_to_add": int(global_units_to_add),
         "global_addition_unit": int(global_addition_unit),
         "global_propagation_direction": global_propagation_direction,
+        "global_transform_mode": global_transform_mode,
     }
 
 
@@ -1080,6 +1210,18 @@ def _render_step_5_review(configs: list[dict] | None = None):
             f"Protofibril {config['protofibril_index']}: start with chains {', '.join(config['chains'])} "
             f"(bottom = {config['bottom_chain']}, top = {config['top_chain']})."
         )
+        lines.append(
+            f"Protofibril {config['protofibril_index']}: transform source = "
+            f"{'helical metadata' if config.get('transform_mode') == 'helical_metadata' else 'chain-fit'}."
+        )
+        if config.get("transform_mode") == "helical_metadata":
+            helical_twist = _as_optional_float(config.get("helical_twist_deg_per_subunit"))
+            helical_rise = _as_optional_float(config.get("helical_rise_angstrom_per_subunit"))
+            if helical_twist is not None and helical_rise is not None:
+                lines.append(
+                    f"Protofibril {config['protofibril_index']}: helical settings = "
+                    f"twist {helical_twist:.4f} deg/subunit, rise {helical_rise:.4f} A/subunit."
+                )
         if config["top_reference_pair"]:
             lines.append(
                 f"Protofibril {config['protofibril_index']}: top propagation pair = "
@@ -1136,6 +1278,7 @@ def _render_propagated_model_preview(propagated_pdb: str):
     chain_ids = [row["chain_id"] for row in propagated_rows]
     propagation_result = st.session_state.get("propagation_result_preview") or {}
     membership_rows = propagation_result.get("protofibril_chain_membership", []) or []
+    propagation_metadata = propagation_result.get("propagation_metadata", []) or []
     seed_chain_ids = {
         str(row.get("chain_id"))
         for row in membership_rows
@@ -1187,6 +1330,29 @@ def _render_propagated_model_preview(propagated_pdb: str):
         show_controls=True,
         force_reload=False,
     )
+    helical_rows = []
+    for row in propagation_metadata:
+        if row.get("transform_mode") != "helical_metadata":
+            continue
+        helical = row.get("helical_parameters") or {}
+        helical_rows.append(
+            {
+                "protofibril_index": row.get("protofibril_index"),
+                "axial_symmetry": helical.get("axial_symmetry"),
+                "angle_deg_per_subunit": helical.get("angle_deg_per_subunit"),
+                "rise_angstrom_per_subunit": helical.get("rise_angstrom_per_subunit"),
+                "top_step_units": helical.get("top_step_units"),
+                "top_angle_deg": helical.get("top_angle_deg"),
+                "top_rise_angstrom": helical.get("top_rise_angstrom"),
+                "bottom_step_units": helical.get("bottom_step_units"),
+                "bottom_angle_deg": helical.get("bottom_angle_deg"),
+                "bottom_rise_angstrom": helical.get("bottom_rise_angstrom"),
+            }
+        )
+    if helical_rows:
+        st.markdown("**Helical Propagation Parameters Used**")
+        st.caption("Values below are the exact rise/twist parameters and inferred step sizes used during propagation.")
+        st.dataframe(pd.DataFrame(helical_rows), width="stretch")
 
 
 def _render_propagated_membership_table():
@@ -2007,7 +2173,11 @@ def main():
             st.session_state.get("propagation_debug_mode") or st.session_state.get("propagation_debug_events")
         ):
             _render_propagation_debug_panel()
-    if st.session_state.get("propagated_pdb_preview"):
+    propagated_preview = st.session_state.get("propagated_pdb_preview")
+    built_signature = st.session_state.get("built_build_signature")
+    current_signature = st.session_state.get("current_build_signature")
+    preview_is_current = bool(propagated_preview) and built_signature == current_signature
+    if preview_is_current:
         st.success("Propagation build finished. Download buttons are available below.")
         st.info("This preview is the rigid propagated structure. Inspect it first, then decide whether optimization is needed.")
         _render_propagated_model_preview(st.session_state["propagated_pdb_preview"])
@@ -2015,13 +2185,15 @@ def main():
         _render_step_7_inspect()
         _render_step_8_optimize()
         _render_step_9_export(uploaded_file.name, pdb_text)
+    elif propagated_preview:
+        st.info("A previous propagated preview exists but is stale for the current settings. Rebuild to inspect/export it.")
 
     with st.expander("Raw PDB Header", expanded=False):
         st.code(pdb_text[:4000], language="text")
         if len(pdb_text) > 4000:
             st.caption("Preview truncated to the first 4000 characters.")
 
-    if not st.session_state.get("propagated_pdb_preview"):
+    if not preview_is_current:
         _render_step_9_export(uploaded_file.name, pdb_text)
 
 

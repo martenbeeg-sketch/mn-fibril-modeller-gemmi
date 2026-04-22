@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import io
+import math
 import string
 import tempfile
 
@@ -92,6 +93,142 @@ def _compute_chain_transform(model, source_chain_id: str, target_chain_id: str):
     superimposer.set_atoms(target_atoms, source_atoms)
     rotation, translation = superimposer.rotran
     return rotation, translation, float(superimposer.rms)
+
+
+def _extract_helical_metadata_from_mmcif_text(structure_text: str) -> dict[str, object] | None:
+    try:
+        document = gemmi.cif.read_string(structure_text)
+        block = document.sole_block()
+    except Exception:
+        return None
+
+    def _first_value(tag: str) -> str | None:
+        try:
+            values = block.find_values(tag)
+        except Exception:
+            return None
+        if not values:
+            return None
+        value = str(values[0]).strip()
+        if not value or value in {".", "?"}:
+            return None
+        return value
+
+    angle_text = _first_value("_em_helical_entity.angular_rotation_per_subunit")
+    rise_text = _first_value("_em_helical_entity.axial_rise_per_subunit")
+    symmetry_text = _first_value("_em_helical_entity.axial_symmetry")
+    if angle_text is None or rise_text is None:
+        return None
+
+    try:
+        angle_deg = float(angle_text)
+        rise_angstrom = float(rise_text)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(angle_deg) or not math.isfinite(rise_angstrom):
+        return None
+    if abs(rise_angstrom) < 1e-8:
+        return None
+
+    return {
+        "angle_deg_per_subunit": angle_deg,
+        "rise_angstrom_per_subunit": rise_angstrom,
+        "axial_symmetry": symmetry_text,
+    }
+
+
+def _gemmi_chain_centroid(chain: gemmi.Chain) -> np.ndarray:
+    coords: list[np.ndarray] = []
+    for residue in chain:
+        ca_atom = next((atom for atom in residue if atom.name.strip() == "CA"), None)
+        if ca_atom is not None:
+            coords.append(np.array([float(ca_atom.pos.x), float(ca_atom.pos.y), float(ca_atom.pos.z)], dtype=float))
+        else:
+            for atom in residue:
+                coords.append(np.array([float(atom.pos.x), float(atom.pos.y), float(atom.pos.z)], dtype=float))
+    if not coords:
+        raise ValueError(f"Chain {chain.name} has no atoms for centroid estimation.")
+    stacked = np.vstack(coords)
+    return stacked.mean(axis=0)
+
+
+def _estimate_protofibril_axis(
+    model: gemmi.Model,
+    proto_chain_ids: list[str],
+) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+    centroids: dict[str, np.ndarray] = {}
+    ordered_centroids: list[np.ndarray] = []
+    for chain_id in proto_chain_ids:
+        chain = _find_gemmi_chain(model, chain_id)
+        centroid = _gemmi_chain_centroid(chain)
+        centroids[chain_id] = centroid
+        ordered_centroids.append(centroid)
+    if len(ordered_centroids) < 2:
+        raise ValueError("At least two chains are required to estimate a protofibril axis.")
+
+    centroid_stack = np.vstack(ordered_centroids)
+    axis_point = centroid_stack.mean(axis=0)
+    centered = centroid_stack - axis_point
+    _, singular_values, vh = np.linalg.svd(centered, full_matrices=False)
+    if singular_values.size == 0:
+        raise ValueError("Failed to estimate protofibril axis from chain centroids.")
+    axis_unit = vh[0].astype(float)
+    axis_norm = float(np.linalg.norm(axis_unit))
+    if axis_norm < 1e-10:
+        raise ValueError("Estimated protofibril axis has near-zero length.")
+    axis_unit = axis_unit / axis_norm
+
+    first_centroid = ordered_centroids[0]
+    last_centroid = ordered_centroids[-1]
+    if float(np.dot(last_centroid - first_centroid, axis_unit)) < 0.0:
+        axis_unit = -axis_unit
+
+    return axis_point, axis_unit, centroids
+
+
+def _rotation_matrix_from_axis_angle(axis_unit: np.ndarray, angle_deg: float) -> np.ndarray:
+    angle_rad = math.radians(angle_deg)
+    x, y, z = axis_unit.astype(float)
+    c = math.cos(angle_rad)
+    s = math.sin(angle_rad)
+    one_minus_c = 1.0 - c
+    return np.array(
+        [
+            [c + x * x * one_minus_c, x * y * one_minus_c - z * s, x * z * one_minus_c + y * s],
+            [y * x * one_minus_c + z * s, c + y * y * one_minus_c, y * z * one_minus_c - x * s],
+            [z * x * one_minus_c - y * s, z * y * one_minus_c + x * s, c + z * z * one_minus_c],
+        ],
+        dtype=float,
+    )
+
+
+def _helical_pair_step_count(
+    source_chain_id: str,
+    target_chain_id: str,
+    *,
+    centroids: dict[str, np.ndarray],
+    axis_unit: np.ndarray,
+    rise_per_subunit: float,
+) -> int:
+    source_centroid = centroids[source_chain_id]
+    target_centroid = centroids[target_chain_id]
+    delta = target_centroid - source_centroid
+    axial_distance = float(np.dot(delta, axis_unit))
+    estimated_steps = int(round(abs(axial_distance) / abs(rise_per_subunit)))
+    return max(1, estimated_steps)
+
+
+def _build_helical_screw_transform(
+    *,
+    axis_point: np.ndarray,
+    axis_unit: np.ndarray,
+    angle_deg: float,
+    rise_angstrom: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    rotation_column = _rotation_matrix_from_axis_angle(axis_unit, angle_deg)
+    rotation_row = rotation_column.T
+    translation = axis_point - rotation_column @ axis_point + rise_angstrom * axis_unit
+    return rotation_row, translation
 
 
 def _next_available_chain_id(used_chain_ids: set[str], output_format: str = "pdb") -> str:
@@ -693,6 +830,31 @@ def build_propagated_model(
 
     propagation_metadata = []
     transforms = {}
+    uses_helical_metadata = any(
+        str(config.get("transform_mode", "chain_fit")) == "helical_metadata"
+        for config in protofibril_configs
+    )
+    helical_metadata: dict[str, object] | None = None
+    if uses_helical_metadata:
+        if input_format != "mmcif":
+            raise ValueError(
+                "Helical metadata transform mode requires mmCIF input with _em_helical_entity fields."
+            )
+        helical_metadata = _extract_helical_metadata_from_mmcif_text(pdb_text)
+        if helical_metadata is None:
+            raise ValueError(
+                "mmCIF helical metadata is missing or invalid. "
+                "Expected _em_helical_entity.angular_rotation_per_subunit and "
+                "_em_helical_entity.axial_rise_per_subunit."
+            )
+        _debug_log(
+            debug_sink,
+            "helical_metadata_detected",
+            angle_deg_per_subunit=float(helical_metadata["angle_deg_per_subunit"]),
+            rise_angstrom_per_subunit=float(helical_metadata["rise_angstrom_per_subunit"]),
+            axial_symmetry=helical_metadata.get("axial_symmetry"),
+        )
+
     for config in protofibril_configs:
         proto_index = config["protofibril_index"]
         top_pair = config.get("top_reference_pair", [])
@@ -701,31 +863,98 @@ def build_propagated_model(
         bottom_transform = None
         top_rms = None
         bottom_rms = None
+        transform_mode = str(config.get("transform_mode", "chain_fit"))
+        helical_parameters: dict[str, object] | None = None
 
-        if len(top_pair) == 2:
-            top_rotation, top_translation, top_rms = _compute_chain_transform(biopython_model, top_pair[0], top_pair[1])
-            top_transform = (top_rotation, top_translation)
+        if transform_mode == "helical_metadata":
+            assert helical_metadata is not None
+            angle_per_subunit = float(config.get("helical_twist_deg_per_subunit", helical_metadata["angle_deg_per_subunit"]))
+            rise_per_subunit = float(config.get("helical_rise_angstrom_per_subunit", helical_metadata["rise_angstrom_per_subunit"]))
+            if not math.isfinite(angle_per_subunit) or not math.isfinite(rise_per_subunit):
+                raise ValueError("Helical metadata transform values must be finite numbers.")
+            if abs(rise_per_subunit) < 1e-8:
+                raise ValueError("Helical rise per subunit must be non-zero.")
+            axis_point, axis_unit, centroids = _estimate_protofibril_axis(gemmi_model, list(config.get("chains", [])))
+
+            top_step_units = 0
+            bottom_step_units = 0
+            if len(top_pair) == 2:
+                top_step_units = _helical_pair_step_count(
+                    top_pair[0],
+                    top_pair[1],
+                    centroids=centroids,
+                    axis_unit=axis_unit,
+                    rise_per_subunit=rise_per_subunit,
+                )
+                top_transform = _build_helical_screw_transform(
+                    axis_point=axis_point,
+                    axis_unit=axis_unit,
+                    angle_deg=angle_per_subunit * top_step_units,
+                    rise_angstrom=rise_per_subunit * top_step_units,
+                )
+            if len(bottom_pair) == 2:
+                bottom_step_units = _helical_pair_step_count(
+                    bottom_pair[0],
+                    bottom_pair[1],
+                    centroids=centroids,
+                    axis_unit=axis_unit,
+                    rise_per_subunit=rise_per_subunit,
+                )
+                bottom_transform = _build_helical_screw_transform(
+                    axis_point=axis_point,
+                    axis_unit=axis_unit,
+                    angle_deg=-angle_per_subunit * bottom_step_units,
+                    rise_angstrom=-rise_per_subunit * bottom_step_units,
+                )
             _debug_log(
                 debug_sink,
-                "transform_top",
+                "transform_helical",
                 protofibril_index=proto_index,
-                source=top_pair[0],
-                target=top_pair[1],
-                rms=float(top_rms),
-                translation_norm=float(np.linalg.norm(top_translation)),
+                angle_deg_per_subunit=angle_per_subunit,
+                rise_angstrom_per_subunit=rise_per_subunit,
+                top_step_units=top_step_units,
+                bottom_step_units=bottom_step_units,
+                axis_point=[float(axis_point[0]), float(axis_point[1]), float(axis_point[2])],
+                axis_unit=[float(axis_unit[0]), float(axis_unit[1]), float(axis_unit[2])],
             )
-        if len(bottom_pair) == 2:
-            bottom_rotation, bottom_translation, bottom_rms = _compute_chain_transform(biopython_model, bottom_pair[0], bottom_pair[1])
-            bottom_transform = (bottom_rotation, bottom_translation)
-            _debug_log(
-                debug_sink,
-                "transform_bottom",
-                protofibril_index=proto_index,
-                source=bottom_pair[0],
-                target=bottom_pair[1],
-                rms=float(bottom_rms),
-                translation_norm=float(np.linalg.norm(bottom_translation)),
-            )
+            helical_parameters = {
+                "axial_symmetry": helical_metadata.get("axial_symmetry"),
+                "angle_deg_per_subunit": angle_per_subunit,
+                "rise_angstrom_per_subunit": rise_per_subunit,
+                "top_step_units": top_step_units,
+                "bottom_step_units": bottom_step_units,
+                "top_angle_deg": angle_per_subunit * top_step_units,
+                "top_rise_angstrom": rise_per_subunit * top_step_units,
+                "bottom_angle_deg": -angle_per_subunit * bottom_step_units,
+                "bottom_rise_angstrom": -rise_per_subunit * bottom_step_units,
+                "axis_point": [float(axis_point[0]), float(axis_point[1]), float(axis_point[2])],
+                "axis_unit": [float(axis_unit[0]), float(axis_unit[1]), float(axis_unit[2])],
+            }
+        else:
+            if len(top_pair) == 2:
+                top_rotation, top_translation, top_rms = _compute_chain_transform(biopython_model, top_pair[0], top_pair[1])
+                top_transform = (top_rotation, top_translation)
+                _debug_log(
+                    debug_sink,
+                    "transform_top",
+                    protofibril_index=proto_index,
+                    source=top_pair[0],
+                    target=top_pair[1],
+                    rms=float(top_rms),
+                    translation_norm=float(np.linalg.norm(top_translation)),
+                )
+            if len(bottom_pair) == 2:
+                bottom_rotation, bottom_translation, bottom_rms = _compute_chain_transform(biopython_model, bottom_pair[0], bottom_pair[1])
+                bottom_transform = (bottom_rotation, bottom_translation)
+                _debug_log(
+                    debug_sink,
+                    "transform_bottom",
+                    protofibril_index=proto_index,
+                    source=bottom_pair[0],
+                    target=bottom_pair[1],
+                    rms=float(bottom_rms),
+                    translation_norm=float(np.linalg.norm(bottom_translation)),
+                )
 
         transforms[proto_index] = {
             "top": top_transform,
@@ -734,10 +963,12 @@ def build_propagated_model(
         propagation_metadata.append(
             {
                 "protofibril_index": proto_index,
+                "transform_mode": transform_mode,
                 "top_reference_pair": top_pair,
                 "bottom_reference_pair": bottom_pair,
                 "top_rms": top_rms,
                 "bottom_rms": bottom_rms,
+                "helical_parameters": helical_parameters,
             }
         )
 
@@ -754,7 +985,15 @@ def build_propagated_model(
     }
 
     addition_log = []
-    total_progress_steps = sum(config["units_to_add"] for config in protofibril_configs)
+
+    def _config_work_units(config: dict) -> int:
+        addition_unit = int(config.get("addition_unit", 1))
+        units_to_add = int(config.get("units_to_add", 0))
+        direction = str(config.get("propagation_direction", "Add to both ends"))
+        direction_multiplier = 2 if direction == "Add to both ends" else 1
+        return units_to_add * addition_unit * direction_multiplier
+
+    total_progress_steps = sum(_config_work_units(config) for config in protofibril_configs)
     completed_progress_steps = 0
     max_iterations = max((config["units_to_add"] for config in protofibril_configs), default=0)
     for iteration in range(1, max_iterations + 1):
@@ -766,15 +1005,6 @@ def build_propagated_model(
             direction = config["propagation_direction"]
             top_transform = transforms[proto_index]["top"]
             bottom_transform = transforms[proto_index]["bottom"]
-            if progress_callback is not None:
-                progress_callback(
-                    completed_progress_steps=completed_progress_steps,
-                    total_progress_steps=total_progress_steps,
-                    protofibril_index=proto_index,
-                    iteration=iteration,
-                    addition_unit=addition_unit,
-                    direction=direction,
-                )
 
             if direction in {"Add to top", "Add to both ends"}:
                 if top_transform is None:
@@ -952,6 +1182,16 @@ def build_propagated_model(
                         source_chain_id=source_chain_id,
                         new_chain_id=new_chain_id,
                     )
+                    completed_progress_steps += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            completed_progress_steps=completed_progress_steps,
+                            total_progress_steps=total_progress_steps,
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            addition_unit=addition_unit,
+                            direction=direction,
+                        )
 
             if direction in {"Add to bottom", "Add to both ends"}:
                 if bottom_transform is None:
@@ -1129,7 +1369,16 @@ def build_propagated_model(
                         source_chain_id=source_chain_id,
                         new_chain_id=new_chain_id,
                     )
-            completed_progress_steps += 1
+                    completed_progress_steps += 1
+                    if progress_callback is not None:
+                        progress_callback(
+                            completed_progress_steps=completed_progress_steps,
+                            total_progress_steps=total_progress_steps,
+                            protofibril_index=proto_index,
+                            iteration=iteration,
+                            addition_unit=addition_unit,
+                            direction=direction,
+                        )
 
     addition_index_by_chain_id = {entry["new_chain_id"]: entry for entry in addition_log}
     protofibril_chain_membership = []
