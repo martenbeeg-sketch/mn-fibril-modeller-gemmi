@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import hashlib
 import zipfile
 
 import numpy as np
@@ -67,6 +68,11 @@ def _uploaded_text(uploaded_file) -> str:
 
 def _stable_signature(payload) -> str:
     return json.dumps(payload, sort_keys=True)
+
+
+def _stable_key_suffix(payload, length: int = 12) -> str:
+    digest = hashlib.sha1(_stable_signature(payload).encode("utf-8")).hexdigest()
+    return digest[:length]
 
 
 def _request_prepare_merged_export():
@@ -629,8 +635,18 @@ def _render_growth_selection_viewer(pdb_text: str, chain_rows, configs):
         ),
         unsafe_allow_html=True,
     )
-    top_bottom_key = "growth_top_bottom_preview"
-    reference_key = "growth_reference_preview"
+    growth_key_suffix = _stable_key_suffix(
+        {
+            "chain_ids": chain_ids,
+            "highlighted_top": sorted(highlighted_top),
+            "highlighted_bottom": sorted(highlighted_bottom),
+            "highlighted_reference": sorted(highlighted_reference),
+            "highlighted_propagated": sorted(highlighted_propagated),
+            "configs": configs,
+        }
+    )
+    top_bottom_key = f"growth_top_bottom_preview_{growth_key_suffix}"
+    reference_key = f"growth_reference_preview_{growth_key_suffix}"
     left, right = st.columns([1, 1], gap="medium")
 
     with left:
@@ -1168,7 +1184,10 @@ def _render_propagated_model_preview(propagated_pdb: str):
         ]
     molstar_custom_component(
         structures=structures,
-        key=f"propagated_preview_{'_'.join(chain_ids)}",
+        key=(
+            "propagated_preview_"
+            f"{_stable_key_suffix({'chain_ids': chain_ids, 'seed_chain_ids': sorted(seed_chain_ids)})}"
+        ),
         height=720,
         show_controls=True,
         force_reload=False,
